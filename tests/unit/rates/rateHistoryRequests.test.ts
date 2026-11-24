@@ -7,6 +7,7 @@ import type { PublicRateHistoryResponse } from "@/types/api/rateHistory";
 const CORRIDOR = "usdc-us-brl-br";
 
 function history(windowDays: number, marker = `${windowDays}d`): PublicRateHistoryResponse {
+  const markerSeconds = marker.startsWith("req-") ? Number(marker.slice(4)) : windowDays;
   return {
     corridor: {
       slug: CORRIDOR,
@@ -15,7 +16,7 @@ function history(windowDays: number, marker = `${windowDays}d`): PublicRateHisto
       destinationAsset: "BRL",
       destinationCountry: "BR",
     },
-    evaluatedAt: `2026-10-01T00:00:00.000Z#${marker}`,
+    evaluatedAt: new Date(Date.UTC(2026, 9, 1, 0, 0, markerSeconds)).toISOString(),
     windowDays,
     points: [],
   };
@@ -270,7 +271,136 @@ test("a response for a different window is rejected rather than shown as the sel
   await network.requests[0]!.respond(jsonResponse(history(7)));
   assert.equal(panel.state.history, null);
   assert.equal(panel.state.loading, false);
-  assert.equal(panel.state.error, "Rate history response did not match the requested window.");
+  assert.equal(panel.state.error, "Rate history response was invalid.");
+});
+
+test("accepts valid history and a genuine empty points array", async () => {
+  const { network, panel, select } = setup();
+
+  select(30);
+  await network.requests[0]!.respond(jsonResponse(history(30)));
+  assert.equal(panel.state.history?.windowDays, 30);
+  assert.equal(panel.state.error, null);
+
+  select(90);
+  await network.requests[1]!.respond(jsonResponse(history(90)));
+  assert.deepEqual(panel.state.history?.points, []);
+  assert.equal(panel.state.history?.windowDays, 90);
+
+  select(7);
+  await network.requests[2]!.respond(jsonResponse({
+    ...history(7),
+    points: [{
+      timestamp: "2026-09-30T00:00:00.000Z",
+      medianRate: null,
+      state: "insufficient_fresh_sources",
+      sourceCount: 0,
+      freshSourceCount: 0,
+      observations: [],
+    }],
+  }));
+  assert.equal(panel.state.history?.points[0]?.medianRate, null);
+  assert.equal(panel.state.history?.points[0]?.observations.length, 0);
+});
+
+test("rejects null or incomplete points using a fixed safe error and retains prior evidence", async () => {
+  const { network, panel, select } = setup();
+
+  select(30);
+  await network.requests[0]!.respond(jsonResponse(history(30)));
+
+  const malformed = [
+    null,
+    { timestamp: "2026-09-30T00:00:00.000Z" },
+    {
+      timestamp: "2026-09-30T00:00:00.000Z",
+      medianRate: null,
+      state: "healthy",
+      sourceCount: 1,
+      freshSourceCount: 1,
+      observations: [null],
+    },
+    {
+      timestamp: "not-a-date",
+      medianRate: null,
+      state: "healthy",
+      sourceCount: 1,
+      freshSourceCount: 1,
+      observations: [],
+    },
+  ];
+
+  for (const point of malformed) {
+    select(90);
+    await network.requests[network.requests.length - 1]!.respond(jsonResponse({
+      ...history(90),
+      points: [point],
+    }));
+    assert.equal(panel.state.history?.windowDays, 30);
+    assert.equal(panel.state.error, "Rate history response was invalid.");
+  }
+});
+
+test("rejects missing envelope fields and unexpected windows", async () => {
+  const { network, panel, select } = setup();
+  const malformedPayloads = [
+    { ...history(30), evaluatedAt: undefined },
+    { ...history(30), corridor: { slug: CORRIDOR } },
+    { ...history(30), windowDays: 14 },
+  ];
+
+  for (const body of malformedPayloads) {
+    select(30);
+    await network.requests[network.requests.length - 1]!.respond(jsonResponse(body));
+    assert.equal(panel.state.history, null);
+    assert.equal(panel.state.error, "Rate history response was invalid.");
+  }
+});
+
+test("rejects malformed observation elements before they reach the chart", async () => {
+  const { network, panel, select } = setup();
+  const malformedHistory = {
+    ...history(30),
+    points: [{
+      timestamp: "2026-09-30T00:00:00.000Z",
+      medianRate: "5.2",
+      state: "healthy",
+      sourceCount: 1,
+      freshSourceCount: 1,
+      observations: [{ anchor: null, rate: "5.2" }],
+    }],
+  };
+
+  select(30);
+  await network.requests[0]!.respond(jsonResponse(malformedHistory));
+  assert.equal(panel.state.history, null);
+  assert.equal(panel.state.error, "Rate history response was invalid.");
+});
+
+test("uses a fixed safe error for malformed JSON from a successful response", async () => {
+  const { network, panel, select } = setup();
+
+  select(30);
+  await network.requests[0]!.respond(jsonResponse(history(30)));
+  select(90);
+  await network.requests[1]!.respond(new Response("{ malformed", { status: 200 }));
+
+  assert.equal(panel.state.history?.windowDays, 30);
+  assert.equal(panel.state.error, "Rate history response was invalid.");
+  assert.doesNotMatch(panel.state.error ?? "", /malformed|JSON|Unexpected/);
+});
+
+test("ignores a malformed response from a superseded request", async () => {
+  const { network, panel, select } = setup();
+
+  select(30);
+  select(90);
+  await network.requests[1]!.respond(jsonResponse(history(90)));
+  await network.requests[0]!.respond(jsonResponse({ ...history(30), points: [null] }));
+
+  assert.equal(panel.state.history?.windowDays, 90);
+  assert.equal(panel.state.error, null);
+  assert.equal(panel.state.settledCount, 1);
 });
 
 test("disposing the loader aborts the pending request and suppresses late updates", async () => {
@@ -295,7 +425,7 @@ test("rapid reversed sequences always converge on the last selection", async () 
     await network.requests[i]!.respond(jsonResponse(history(selections[i]!, `req-${i}`)));
   }
 
-  assert.equal(panel.state.history?.evaluatedAt.endsWith("#req-4"), true);
+  assert.equal(panel.state.history?.evaluatedAt, "2026-10-01T00:00:04.000Z");
   assert.equal(panel.state.settledCount, 1);
   assert.equal(panel.state.loading, false);
 });
